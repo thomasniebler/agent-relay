@@ -2,6 +2,7 @@
 """Local HTTP coordination facade. Native Beads and Agent Mail own all data."""
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hmac
 import ipaddress
 import json
@@ -349,6 +350,18 @@ class Relay:
         return {**event, 'acknowledged': bool(recipient and recipient.get('acknowledged')),
                 'acknowledged_at': recipient.get('acknowledged_at') if recipient else None}
 
+    def inbox_ack_states(self, agent_name, events):
+        results = [None] * len(events)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(self.inbox_ack_state, agent_name, event): index
+                       for index, event in enumerate(events) if event.get('ack_required')}
+            for index, event in enumerate(events):
+                if not event.get('ack_required'):
+                    results[index] = self.inbox_ack_state(agent_name, event)
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return results
+
     @classmethod
     def redact(cls, value):
         if isinstance(value, dict):
@@ -407,8 +420,7 @@ class Relay:
                 for _ in range(10000):
                     page = self.mail('fetch_inbox_events', {**identity, 'after': cursor, 'limit': 1000})
                     tail = page.get('tail_cursor', tail)
-                    events = [self.inbox_ack_state(agent['mail_name'], event)
-                              for event in page.get('events', [])]
+                    events = self.inbox_ack_states(agent['mail_name'], page.get('events', []))
                     pending.extend(event for event in events
                                    if event.get('ack_required') and not event['acknowledged'])
                     next_cursor = page.get('next_cursor', cursor)
@@ -421,8 +433,7 @@ class Relay:
                     cursor = next_cursor
                 raise RelayError(503, 'inbox_too_large', 'Inbox history exceeds safe pending-ack scan limit')
             page = self.mail('fetch_inbox_events', {**identity, 'after': after, 'limit': limit})
-            events = [self.inbox_ack_state(agent['mail_name'], event)
-                      for event in page.get('events', [])]
+            events = self.inbox_ack_states(agent['mail_name'], page.get('events', []))
             return {**page, 'events': events}
         if len(parts) == 2 and parts[0] == 'messages' and method == 'GET':
             require(parts[1].isdigit(), 'invalid_id', 'Invalid message identifier')
