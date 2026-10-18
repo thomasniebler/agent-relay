@@ -70,7 +70,7 @@ read from the private client file by `client.py`, not passed on a command line.
 | `PATCH /tasks/{id}` | Set `status`, `notes`, or `evidence` with `version` |
 | `POST /tasks/{id}/blockers` | Record a permission blocker; an open blocker prevents handoff, claim, and close |
 | `POST /tasks/{id}/handoff` | Send task for review with recipient, full commit SHA, and evidence |
-| `POST /tasks/{id}/review` | Named recipient accepts or requests changes against that exact SHA |
+| `POST /tasks/{id}/review` | JSON `{version, sha, verdict, evidence}`; named recipient reviews the exact SHA; `verdict` is `accept` or `request_changes` |
 | `GET /inbox?after={cursor}` | Read recipient events; each event includes `acknowledged` and `acknowledged_at` |
 | `GET /inbox?pending_ack=true` | Full snapshot of unacknowledged, acknowledgment-required events |
 | `GET /messages/{id}` | Retrieve the body only for a message in this agent's inbox |
