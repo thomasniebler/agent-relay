@@ -41,9 +41,10 @@ Mail MCP). A second terminal can use `client.py`:
 
 ```sh
 python3 client.py --agent codex GET /tasks
-python3 client.py --agent codex POST /tasks \
-  --body '{"title":"Review dashboard","acceptance_criteria":"Verify exact PR head"}'
+printf '%s' '{"title":"Review dashboard","acceptance_criteria":"Verify exact PR head"}' \
+  | python3 client.py --agent codex POST /tasks --body -
 python3 client.py --agent claude GET /inbox
+python3 client.py --agent claude GET '/inbox?pending_ack=true'
 ```
 
 Client credentials are in `.local/clients/{codex,claude}.json` with mode 0600.
@@ -61,8 +62,8 @@ read from the private client file by `client.py`, not passed on a command line.
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /tasks` | List tasks; optional `?state=open` |
-| `POST /tasks` | Create with `title`, optional `description`, `acceptance_criteria` |
+| `GET /tasks` | List tasks in `tasks`; optional exact `?state=open` filter or active-work summary `?state=active`; pages use `?offset=1000` |
+| `POST /tasks` | Create JSON `{title, description?, acceptance_criteria?}` |
 | `GET /tasks/{id}` | Read task and relay metadata |
 | `POST /tasks/{id}/claim` | Exclusive claim with `version`, `session_id`, optional `lease_seconds` |
 | `POST /tasks/{id}/heartbeat` | Renew the same session lease |
@@ -70,11 +71,16 @@ read from the private client file by `client.py`, not passed on a command line.
 | `POST /tasks/{id}/blockers` | Record a permission blocker; an open blocker prevents handoff, claim, and close |
 | `POST /tasks/{id}/handoff` | Send task for review with recipient, full commit SHA, and evidence |
 | `POST /tasks/{id}/review` | Named recipient accepts or requests changes against that exact SHA |
-| `GET /inbox?after={cursor}` | Read recipient's incremental event feed |
+| `GET /inbox?after={cursor}` | Read recipient events; each event includes `acknowledged` and `acknowledged_at` |
+| `GET /inbox?pending_ack=true` | Full snapshot of unacknowledged, acknowledgment-required events |
 | `GET /messages/{id}` | Retrieve the body only for a message in this agent's inbox |
-| `POST /messages` | Send to configured agent IDs, with optional idempotency key |
+| `POST /messages` | JSON `{to, subject, body, thread_id?, ack_required?, idempotency_key?}`; `to` uses configured agent IDs |
 | `POST /messages/{id}/read` | Mark read without acknowledging |
 | `POST /messages/{id}/ack` | Acknowledge a message |
+
+Task status transitions use Beads statuses (`review` is a workflow status). For a message request, `to` is a nonempty list such as `["claude"]`, and `body` is Markdown text. The sender identity is derived from the bearer token and cannot be supplied in the request. The pending-ack view rescans the retained event feed on each call, so it continues to show unacknowledged messages; omit `after` for this snapshot. It is separate from the incremental inbox cursor.
+
+Every task mutation requires the current version. A heartbeat updates that version, so clients must reread before their next task change. `GET /tasks?state=...` is an exact single-state filter; `state=active` combines `open`, `in_progress`, `blocked`, and `review` for an overview.
 
 Task status transitions use Beads statuses (`review` is a workflow status). To close, first record an
 accepted independent review on the current handoff SHA, then PATCH status to

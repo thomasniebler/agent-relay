@@ -23,6 +23,14 @@ TASK_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 SHA = re.compile(r'^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$')
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
 class RelayError(Exception):
     def __init__(self, status, code, message):
         super().__init__(message)
@@ -43,7 +51,10 @@ def text(data, key, required=True):
 
 def fields(data, allowed):
     require(isinstance(data, dict), 'invalid_body', 'Expected a JSON object')
-    require(not set(data).difference(allowed), 'unknown_fields', 'Unknown request field')
+    unknown = sorted(set(data).difference(allowed))
+    if unknown:
+        labels = ', '.join(name[:80] for name in unknown[:8])
+        raise RelayError(400, 'unknown_fields', 'Unknown request field(s): ' + labels)
 
 
 def loopback(host):
@@ -132,7 +143,8 @@ class Relay:
             raise RelayError(409, 'metadata_conflict', 'Task context contains invalid JSON')
 
     def view(self, task):
-        result = {key: value for key, value in task.items() if key != 'agent_context'}
+        result = {key: value for key, value in task.items()
+                  if key not in ('agent_context', 'source_repo_path')}
         meta = self.context(task).get('relay', {})
         result.update(version=task['updated_at'], relay=meta)
         lease = meta.get('lease') or {}
@@ -256,11 +268,13 @@ class Relay:
                         return self.view(self.get(task_id))
                     if status_value == 'review':
                         require(meta.get('head_sha'), 'handoff_required', 'Create a commit handoff first', 409)
-                    if status_value == 'in_progress' and task['status'] == 'review':
+                    if status_value == 'in_progress':
                         meta['review'] = None
                         meta.pop('head_sha', None)
                         meta.pop('handoff', None)
                     args += ['--status', status_value]
+                    if task['status'] == 'blocked' and status_value == 'in_progress':
+                        args.append('--force')
                 return self.update(task, actor, meta, *args)
             else:
                 raise RelayError(404, 'not_found', 'Route not found')
@@ -273,7 +287,7 @@ class Relay:
             headers={'Authorization': 'Bearer ' + self.config['mail_token'],
                      'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with HTTP.open(request, timeout=30) as response:
                 raw = response.read(MAX_BODY + 1).decode()
             require(len(raw) <= MAX_BODY, 'upstream_too_large', 'Upstream response too large', 502)
             if raw.startswith(('event:', 'data:')):
@@ -296,7 +310,7 @@ class Relay:
             headers={'Authorization': 'Bearer ' + self.config['mail_token'],
                      'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with HTTP.open(request, timeout=30) as response:
                 raw = response.read(MAX_BODY + 1).decode()
             require(len(raw) <= MAX_BODY, 'upstream_too_large', 'Upstream response too large', 502)
             if raw.startswith(('event:', 'data:')):
@@ -324,11 +338,23 @@ class Relay:
             after = next_cursor
         raise RelayError(503, 'inbox_too_large', 'Inbox history exceeds safe lookup limit')
 
+    def inbox_ack_state(self, agent_name, event):
+        if not event.get('ack_required'):
+            return {**event, 'acknowledged': None, 'acknowledged_at': None}
+        receipt = self.mail('get_message_delivery_receipt', {
+            'project_key': self.config['mail_project'], 'message_id': event['message_id']})
+        recipient = next((item for item in receipt.get('recipients', [])
+                          if item.get('recipient') == agent_name and item.get('kind') == event.get('kind')),
+                         None)
+        return {**event, 'acknowledged': bool(recipient and recipient.get('acknowledged')),
+                'acknowledged_at': recipient.get('acknowledged_at') if recipient else None}
+
     @classmethod
     def redact(cls, value):
         if isinstance(value, dict):
             return {k: cls.redact(v) for k, v in value.items()
-                    if k not in ('registration_token', 'sender_token', 'token', 'mail_token')}
+                    if k not in ('registration_token', 'sender_token', 'token', 'mail_token',
+                                 'project', 'source_repo_path')}
         if isinstance(value, list):
             return [cls.redact(v) for v in value]
         return value
@@ -337,11 +363,27 @@ class Relay:
         parts = [urllib.parse.unquote(p) for p in path.split('/') if p]
         if parts == ['tasks'] and method == 'GET':
             with self.lock:
-                args = ['list', '--all', '--limit', '1000']
+                try:
+                    offset = int(query.get('offset', ['0'])[0])
+                except ValueError:
+                    raise RelayError(400, 'invalid_filter', 'offset must be an integer')
+                require(0 <= offset <= 1000000, 'invalid_filter', 'offset is out of range')
+                args = ['list', '--all', '--limit', '1000', '--offset', str(offset)]
                 if 'state' in query:
-                    args += ['--status', query['state'][0]]
+                    state = query['state'][0]
+                    require(state in ('active', 'open', 'in_progress', 'blocked', 'deferred', 'draft',
+                                      'closed', 'tombstone', 'pinned', 'review'),
+                            'invalid_filter', 'Unsupported task state')
+                    if state != 'active':
+                        args += ['--status', state]
                 result = self.br(*args)
-                return {**result, 'issues': [self.view(t) for t in result['issues']]}
+                response = {k: v for k, v in result.items() if k != 'issues'}
+                tasks = [self.view(t) for t in result['issues']]
+                if query.get('state', [''])[0] == 'active':
+                    tasks = [task for task in tasks
+                             if task.get('status') in ('open', 'in_progress', 'blocked', 'review')]
+                    response['returned'] = len(tasks)
+                return {**response, 'tasks': tasks}
         if parts and parts[0] == 'tasks' and len(parts) <= 3:
             action = parts[2] if len(parts) == 3 else None
             allowed = (len(parts) == 1 and method == 'POST') or (len(parts) == 2 and method in ('GET', 'PATCH')) or (len(parts) == 3 and method == 'POST')
@@ -355,7 +397,33 @@ class Relay:
             except ValueError:
                 raise RelayError(400, 'invalid_cursor', 'after and limit must be integers')
             require(after >= 0 and 1 <= limit <= 1000, 'invalid_cursor', 'Invalid inbox cursor or limit')
-            return self.mail('fetch_inbox_events', {**identity, 'after': after, 'limit': limit})
+            pending_filter = query.get('pending_ack', ['false'])[0]
+            require(pending_filter in ('true', 'false'), 'invalid_filter',
+                    'pending_ack must be true or false')
+            if pending_filter == 'true':
+                require('after' not in query, 'invalid_filter',
+                        'pending_ack is a full pending snapshot; omit after')
+                cursor, pending, tail = 0, [], 0
+                for _ in range(10000):
+                    page = self.mail('fetch_inbox_events', {**identity, 'after': cursor, 'limit': 1000})
+                    tail = page.get('tail_cursor', tail)
+                    events = [self.inbox_ack_state(agent['mail_name'], event)
+                              for event in page.get('events', [])]
+                    pending.extend(event for event in events
+                                   if event.get('ack_required') and not event['acknowledged'])
+                    next_cursor = page.get('next_cursor', cursor)
+                    if not page.get('has_more'):
+                        return {'events': pending[:limit], 'pending_total': len(pending),
+                                'has_more_pending': len(pending) > limit,
+                                'scanned_through_cursor': tail}
+                    require(next_cursor > cursor, 'mail_cursor_error',
+                            'Inbox cursor did not advance', 502)
+                    cursor = next_cursor
+                raise RelayError(503, 'inbox_too_large', 'Inbox history exceeds safe pending-ack scan limit')
+            page = self.mail('fetch_inbox_events', {**identity, 'after': after, 'limit': limit})
+            events = [self.inbox_ack_state(agent['mail_name'], event)
+                      for event in page.get('events', [])]
+            return {**page, 'events': events}
         if len(parts) == 2 and parts[0] == 'messages' and method == 'GET':
             require(parts[1].isdigit(), 'invalid_id', 'Invalid message identifier')
             message_id = int(parts[1])
@@ -384,7 +452,10 @@ class Relay:
         if len(parts) == 3 and parts[0] == 'messages' and parts[2] == 'ack' and method == 'POST':
             fields(body, set())
             require(parts[1].isdigit(), 'invalid_id', 'Invalid message identifier')
-            return self.mail('acknowledge_message', {**identity, 'message_id': int(parts[1])})
+            message_id = int(parts[1])
+            require(self.inbox_contains(identity, message_id), 'message_not_found',
+                    'Message is not in this agent inbox', 404)
+            return self.mail('acknowledge_message', {**identity, 'message_id': message_id})
         if len(parts) == 3 and parts[0] == 'messages' and parts[2] == 'read' and method == 'POST':
             fields(body, set())
             require(parts[1].isdigit(), 'invalid_id', 'Invalid message identifier')

@@ -32,7 +32,8 @@ upstream `fetch_inbox` implicitly marks read, so the gateway uses the event feed
 - Session and lease recorded on a task. Expiry is visible, advisory and never
   proof that the old process stopped. No automatic takeover.
 - Version required for state changes. Stale writes fail rather than overwrite.
-- Handoff offer and recipient acceptance are distinct operations.
+- Handoff records a named review recipient; that recipient accepts or requests
+  changes in a separate review operation. The author remains task owner.
 - Review binds an independent reviewer and evidence to an exact commit SHA.
   Changing the head invalidates the old acceptance for completion.
 - An open permission blocker prevents completion/ownership transfer. Recording

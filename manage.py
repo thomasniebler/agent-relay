@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Explicit local provisioning and foreground supervision; no global install."""
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -10,11 +11,20 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / '.local'
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
 
 def private_json(path, value):
@@ -24,13 +34,50 @@ def private_json(path, value):
         stream.write('\n')
 
 
+def replace_private_json(path, value):
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.state-')
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, indent=2)
+            stream.write('\n')
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def proc_start_ticks(pid):
+    try:
+        record = Path(f'/proc/{pid}/stat').read_text()
+        fields = record[record.rfind(')') + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_our_supervisor(pid, start_ticks):
+    if proc_start_ticks(pid) != start_ticks:
+        return False
+    try:
+        command = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    except OSError:
+        return False
+    script = str(ROOT / 'manage.py').encode()
+    try:
+        working_directory = Path(f'/proc/{pid}/cwd').resolve()
+    except OSError:
+        return False
+    return (script in command or b'manage.py' in command) and b'serve' in command and working_directory == ROOT
+
+
 def rpc(config, name, arguments):
     payload = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                'params': {'name': name, 'arguments': arguments}}
     request = urllib.request.Request(config['mail_url'], json.dumps(payload).encode(),
         headers={'Authorization': 'Bearer ' + config['mail_token'],
                  'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'})
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with HTTP.open(request, timeout=20) as response:
         raw = response.read().decode()
     if raw.startswith(('event:', 'data:')):
         raw = next(line[6:] for line in raw.splitlines() if line.startswith('data: '))
@@ -77,6 +124,12 @@ def serve():
     config_path = LOCAL / 'config.json'
     config = json.loads(config_path.read_text())
     runtime = json.loads((LOCAL / 'runtime.json').read_text())
+    lock_stream = (LOCAL / 'supervisor.lock').open('a')
+    try:
+        fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_stream.close()
+        raise SystemExit('Agent Relay is already supervised; refusing a second instance')
     mail_log = (LOCAL / 'logs/mail.log').open('a')
     relay_log = (LOCAL / 'logs/relay.log').open('a')
     env = {**os.environ, 'HTTP_BEARER_TOKEN': config['mail_token'],
@@ -126,7 +179,11 @@ def serve():
             '--host', '127.0.0.1', '--port', str(runtime['http_port'])],
             cwd=ROOT, stdout=relay_log, stderr=relay_log)
         children.append(relay)
-        private_json(LOCAL / 'supervisor.pid', {'pid': os.getpid()})
+        start_ticks = proc_start_ticks(os.getpid())
+        if start_ticks is None:
+            raise RuntimeError('Cannot verify supervisor process identity on this host')
+        replace_private_json(LOCAL / 'supervisor.pid',
+                             {'pid': os.getpid(), 'start_ticks': start_ticks})
         print(f'Gateway http://127.0.0.1:{runtime["http_port"]}; private clients in .local/clients/', flush=True)
         while all(child.poll() is None for child in children):
             time.sleep(.5)
@@ -142,9 +199,16 @@ def serve():
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
-        (LOCAL / 'supervisor.pid').unlink(missing_ok=True)
+        pid_file = LOCAL / 'supervisor.pid'
+        try:
+            recorded = json.loads(pid_file.read_text())
+            if recorded.get('pid') == os.getpid():
+                pid_file.unlink()
+        except (OSError, ValueError):
+            pass
         mail_log.close()
         relay_log.close()
+        lock_stream.close()
 
 
 def main():
@@ -163,7 +227,14 @@ def main():
     elif args.command == 'serve':
         serve()
     else:
-        pid = json.loads((LOCAL / 'supervisor.pid').read_text())['pid']
+        pid_file = LOCAL / 'supervisor.pid'
+        try:
+            record = json.loads(pid_file.read_text())
+        except (OSError, ValueError):
+            raise SystemExit('No running Agent Relay supervisor found')
+        pid = record.get('pid')
+        if type(pid) is not int or not is_our_supervisor(pid, record.get('start_ticks')):
+            raise SystemExit('Supervisor PID is stale or does not identify Agent Relay; refusing to signal it')
         os.kill(pid, signal.SIGTERM)
 
 
