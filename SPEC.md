@@ -38,7 +38,8 @@ upstream `fetch_inbox` implicitly marks read, so the gateway uses the event feed
   Changing the head invalidates the old acceptance for completion.
 - An open permission blocker prevents completion/ownership transfer. Recording
   one does not grant authority to override a tool denial. No agent-facing unblock
-  endpoint in this slice; operator recovery is an explicit offline procedure.
+  endpoint or separate human-approval record in this slice; operator recovery is
+  an explicit offline procedure.
 - Addressed message send, incremental inbox and explicit acknowledgment.
 - Loopback binding and distinct agent bearer tokens stored in private files.
 
