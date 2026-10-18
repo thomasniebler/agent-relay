@@ -62,7 +62,7 @@ read from the private client file by `client.py`, not passed on a command line.
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /tasks` | List tasks in `tasks`; optional exact `?state=open` filter or active-work summary `?state=active`; pages use `?offset=1000` |
+| `GET /tasks` | List tasks in `tasks`; optional exact `?state=open` filter or active-work summary `?state=active`; pages use `?offset=0&limit=100` (`limit` 1–1000) |
 | `POST /tasks` | Create JSON `{title, description?, acceptance_criteria?}` |
 | `GET /tasks/{id}` | Read task and relay metadata |
 | `POST /tasks/{id}/claim` | Exclusive claim with `version`, `session_id`, optional `lease_seconds` |
@@ -82,7 +82,7 @@ Task status transitions use Beads statuses (`review` is a workflow status). For 
 
 Every task mutation requires the current version. A heartbeat updates that version, so clients must reread before their next task change. `GET /tasks?state=...` is an exact single-state filter; `state=active` combines `open`, `in_progress`, `blocked`, and `review` for an overview.
 
-To resume a nonterminal blocked task with no open permission blocker, patch its status to `in_progress` with the latest version. That clears any previous handoff review. Closed tasks are terminal through this API.
+To resume a nonterminal `blocked` or `review` task with no open permission blocker, patch its status to `in_progress` with the latest version. That clears any previous handoff, review, and evidence. Closed tasks are terminal through this API.
 
 Task status transitions use Beads statuses (`review` is a workflow status). To close, first record an
 accepted independent review on the current handoff SHA, then PATCH status to

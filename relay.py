@@ -273,8 +273,9 @@ class Relay:
                         meta['review'] = None
                         meta.pop('head_sha', None)
                         meta.pop('handoff', None)
+                        meta.pop('evidence', None)
                     args += ['--status', status_value]
-                    if task['status'] == 'blocked' and status_value == 'in_progress':
+                    if task['status'] in ('blocked', 'review') and status_value == 'in_progress':
                         args.append('--force')
                 return self.update(task, actor, meta, *args)
             else:
@@ -378,10 +379,12 @@ class Relay:
             with self.lock:
                 try:
                     offset = int(query.get('offset', ['0'])[0])
+                    limit = int(query.get('limit', ['100'])[0])
                 except ValueError:
-                    raise RelayError(400, 'invalid_filter', 'offset must be an integer')
+                    raise RelayError(400, 'invalid_filter', 'offset and limit must be integers')
                 require(0 <= offset <= 1000000, 'invalid_filter', 'offset is out of range')
-                args = ['list', '--all', '--limit', '1000', '--offset', str(offset)]
+                require(1 <= limit <= 1000, 'invalid_filter', 'limit must be between 1 and 1000')
+                args = ['list', '--all', '--limit', str(limit), '--offset', str(offset)]
                 if 'state' in query:
                     state = query['state'][0]
                     require(state in ('active', 'open', 'in_progress', 'blocked', 'deferred', 'draft',
